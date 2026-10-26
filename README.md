@@ -1,8 +1,8 @@
 # SaaS Platform - PostgreSQL Schema
 
-A production-oriented database schema for a multi-tenant SaaS application. Covers auth, organisations, subscription billing, one-off product purchases, and the usual operational stuff (audit log, webhooks, notifications).
+A database design reference for a multi-tenant SaaS application. Covers auth, organisations, subscription billing, one-off product purchases, and the usual operational stuff (audit log, webhooks, notifications).
 
-Built with **PostgreSQL 15+**.
+Targets **PostgreSQL 15+**. The executable contract suite and CI workflow check schema loading, application-role privileges, tenant isolation, connection reuse and reference integrity. This is a starting point for application design, with no production deployment or independent security review claimed.
 
 ---
 
@@ -10,24 +10,24 @@ Built with **PostgreSQL 15+**.
 
 | Section | Tables | Notes |
 |---|---|---|
-| Auth | `users`, `sessions`, `one_time_tokens`, `oauth_accounts` | Session tokens are stored as SHA-256 hashes. Raw tokens go to the client only. |
+| Auth | `users`, `sessions`, `one_time_tokens`, `oauth_accounts` | The trusted application must hash tokens before storage and manage rotation/expiry. |
 | Organisations | `organisations`, `org_members` | Every account is an org. Personal accounts are just orgs with one seat, which makes B2B team upgrades trivial. |
 | Billing | `plans`, `subscriptions`, `coupons` | Mirrors Stripe's object model so webhook reconciliation is straightforward. Per-seat quantity on subscriptions. |
 | Products | `products` | One-off purchasable items, separate from recurring plans. |
 | Invoices | `invoices`, `invoice_line_items` | `amount_due_cents` is a generated column so it's never out of sync. |
 | Payments | `payment_methods`, `charges` | Card details are display-only (last4 / brand). Raw PANs never touch this database. |
 | Orders | `orders`, `order_items` | Fulfilment metadata stored as JSONB, so it works equally well for downloads, licence keys, or physical goods. |
-| Audit log | `audit_log` | Append-only. BigInt identity PK is intentional, no gaps. |
-| Developer tier | `api_keys`, `webhook_endpoints`, `webhook_deliveries` | HMAC-signed outbound webhooks with exponential retry tracking. |
+| Audit log | `audit_log` | Read-only to the tenant role; trusted services write. BigInt identity values can have gaps. |
+| Developer tier | `api_keys`, `webhook_endpoints`, `webhook_deliveries` | Fields for signing and retry tracking; delivery/signing code is not included. |
 | Notifications | `notification_preferences`, `notifications` | Per-channel granularity (email / in-app / SMS) stored in JSONB maps. |
 
 ---
 
 ## Design decisions
 
-**UUIDs everywhere.** All primary keys are `uuid_generate_v4()`. This prevents ID enumeration attacks, plays nicely with distributed inserts if we ever need to shard, and means IDs can be generated client-side before the row hits the database.
+**Identifiers.** Most primary keys use `uuid_generate_v4()`; `audit_log` uses a bigint identity. UUIDs make sequential enumeration harder and permit distributed generation. IDs are not access controls. PostgreSQL sequences/identities can have gaps after rollbacks, caching or failed inserts.
 
-**Soft deletes.** Most tables use a `deleted_at` timestamp rather than a hard `DELETE`. Partial indexes (`WHERE deleted_at IS NULL`) keep query performance equivalent to a hard delete while preserving the history for support and compliance.
+**Soft deletes.** Most tables use a `deleted_at` timestamp rather than a hard `DELETE`. Partial indexes (`WHERE deleted_at IS NULL`) support active-row queries. Storage, performance and retention still need workload-specific evaluation.
 
 **JSONB for variable-width data.** Plan limits, feature flags, billing addresses, and OAuth raw profiles are all stored as JSONB. These fields vary enough between rows that normalising them into columns would just produce a wide, sparse table nobody wants to look at.
 
@@ -35,7 +35,7 @@ Built with **PostgreSQL 15+**.
 
 **Single `set_updated_at` trigger.** One PL/pgSQL function, attached via a DO block loop. Adding a new table to the list is a one-liner.
 
-**Row-Level Security.** All org-scoped tables have RLS enabled. The application sets `app.current_org_id` at the start of each request and every query is automatically filtered to that tenant. A bug in the application layer cannot leak one org's data to another.
+**Row-Level Security.** Tenant tables have RLS policies evaluated against `app.current_org_id`, with explicit grants in `bootstrap.sql`. This limits queries made under the correct authorized tenant context. The GUC is caller-controlled: a caller able to execute arbitrary SQL can change tenants. RLS does not authenticate users or enforce membership roles, and owners/superusers/`BYPASSRLS` roles bypass it. The trusted application must authorize every request and prevent SQL injection.
 
 **Stripe IDs on the billing rows themselves.** Keeping `stripe_subscription_id`, `stripe_invoice_id`, etc. directly on the relevant rows (rather than a separate integration table) means a single lookup ties any incoming webhook to the right record.
 
@@ -52,30 +52,65 @@ Built with **PostgreSQL 15+**.
 
 ```bash
 psql -U postgres -c "CREATE DATABASE saas_dev;"
-psql -U postgres -d saas_dev -f schema.sql
+psql -X -v ON_ERROR_STOP=1 -U postgres -d saas_dev -f schema.sql
+psql -X -v ON_ERROR_STOP=1 -U postgres -d saas_dev -f bootstrap.sql
 ```
 
+`schema.sql` is a fresh-database script, not an incremental migration. `bootstrap.sql` must run once as the schema owner with `CREATEROLE`. It creates a cluster-wide `saas_app` role and deliberately fails if that role exists; review existing role ownership/memberships/grants before adapting it for another database. It also revokes public schema creation from `PUBLIC` in this database. New tables receive no automatic app grants.
+
 The seed block at the bottom of the file creates:
+
 - Four plans (Starter / Growth / Pro / Enterprise)
 - A demo organisation (`acme-corp`)
-- A demo user (`ava@acme.example` / password: `examp40`)
+- A demo identity (`jane@acme.example`) with `password_hash = NULL`; no password login or demo credential is provided
 - An active trialing subscription on the Growth plan
 
 If you're applying this to a real environment, delete or comment out **Section 16** first.
 
 ### Connecting as a tenant
 
-The RLS policies expect a session variable on each connection:
+`saas_app` is a restricted `NOLOGIN` privilege role, never the schema owner, superuser, `BYPASSRLS`, or a member of an administrative role. Provision a separate authenticated server login with a narrowly scoped grant, for example:
 
 ```sql
-SET app.current_org_id = '22222222-0000-0000-0000-000000000001';
-
--- All queries are now scoped to Acme Corp automatically.
-SELECT * FROM subscriptions;
-SELECT * FROM invoices;
+-- As an administrator, once. Configure credentials/authentication separately.
+CREATE ROLE saas_server LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+GRANT saas_app TO saas_server;
 ```
 
-If you're using a connection pool (PgBouncer, etc.), set this variable in a `SET` command right after acquiring a connection from the pool.
+Authenticate the end user through a separate trusted auth service. Check current membership (`accepted_at`, `deleted_at`) and whether that user may perform the requested operation; `org_members.role` is data, not an implemented permission system. Only then, on a checked-out connection authenticated as `saas_server`:
+
+```sql
+BEGIN;
+SET LOCAL ROLE saas_app;
+-- In real server code use a bound UUID parameter:
+-- SELECT set_config('app.current_org_id', $1, true);
+SET LOCAL app.current_org_id = '22222222-0000-0000-0000-000000000001';
+SELECT * FROM subscriptions;
+SELECT * FROM invoices;
+COMMIT;
+```
+
+All request queries must execute in that same transaction. Roll back on every error before releasing the connection. Use transaction-compatible pooling; statement pooling cannot preserve this transaction contract. Never use session-level `SET app.current_org_id`: `SET LOCAL` reverts to the previous session value at commit/rollback, so initialize connections with empty context and discard/reset any connection with legacy session state. Configure tenant-free role/database defaults. Missing/empty context returns no tenant rows and rejects tenant writes; a malformed UUID raises an error. The test suite exercises commit, rollback and failure on one physical connection. See PostgreSQL's [SET LOCAL semantics](https://www.postgresql.org/docs/16/sql-set.html) and [RLS trust boundary](https://www.postgresql.org/docs/16/ddl-rowsecurity.html).
+
+The tenant role can read/update its organisation, manage tenant resources, memberships and scoped notifications, read global plans/products and read tenant audit records. It cannot create organisations, write audit history, administer global catalogues, truncate tables or change policies. Enforce finer permissions (member versus admin, billing access, notification recipient visibility, soft-deleted rows and hidden catalogue entries) in the trusted server. In particular, the tenant notification policy is org-wide; it does not isolate individual users within an org.
+
+`users`, `sessions`, `one_time_tokens`, `oauth_accounts`, `notification_preferences` and `coupons` are global service data with no tenant-role grants. Null-org notifications and audit events remain administrative data. Administrative auth/billing/audit/notification services need separately reviewed privileges; this repository does not implement those services. Hashing, encryption, rotation, webhook signing and delivery are application responsibilities. The legacy `webhook_endpoints.secret_hash` field needs encrypted, recoverable signing material (or a key reference); a one-way hash alone cannot be used as the original HMAC key.
+
+Composite foreign keys prevent invoices linking another tenant's subscription, charges linking another tenant's invoice/payment method, and orders linking another tenant's invoice/charge. Orders, API key creators and scoped notification recipients require an org membership row. This is reference consistency, not proof of active membership or authorization. Global audit/invitation actors may legitimately be administrators outside the org. Child line/item/delivery rows derive their tenant from their sole parent. Optional resource links remain nullable; historical references can prevent hard deletion of membership rows. Existing deployments need a reviewed migration and cleanup of inconsistent data before adding these constraints.
+
+### Run the database contract tests
+
+Install PostgreSQL server/client binaries, the three extensions and Python 3, then run as a normal user (not root):
+
+```bash
+bash ./scripts/test.sh
+# If pg_config points at another version:
+PG_BIN=/usr/lib/postgresql/16/bin bash ./scripts/test.sh
+```
+
+The command creates a private disposable cluster under `/tmp`, accepts only local Unix-socket connections in that private directory, loads schema/bootstrap, and runs `tests/test_contract.py` with real app-role connections. It cleans up on exit and never uses the host database service. Local `trust` authentication is limited to this disposable test cluster; configure authentication for real deployments separately. The GitHub Actions workflow runs the same command on PostgreSQL 15–18.
+
+Tests cover no context, both tenants, wrong-tenant writes/reparenting, child resources, membership management, scoped/global notifications, global auth denial, role/owner differences, privilege escalation denial, connection reuse, inconsistent foreign keys even as owner, generated amounts, single default payment method and API key revocation. They do not simulate a full application or establish protection against compromised trusted server code.
 
 ---
 
@@ -122,4 +157,4 @@ A few things were left out on purpose to keep this focused:
 
 ## License
 
-MIT
+[MIT](LICENSE), copyright Ava Hall (ah682).

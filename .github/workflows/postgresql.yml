@@ -1,0 +1,25 @@
+name: PostgreSQL tenant contract
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  tenant-contract:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['15', '16', '17', '18']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL server and extensions
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y postgresql-${{ matrix.postgres }} postgresql-contrib-${{ matrix.postgres }}
+      - name: Smoke, isolation, privileges, integrity and connection reuse
+        env:
+          PG_BIN: /usr/lib/postgresql/${{ matrix.postgres }}/bin
+        run: bash ./scripts/test.sh

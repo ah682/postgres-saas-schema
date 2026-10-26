@@ -3,14 +3,14 @@
 -- =============================================================================
 -- Stack: PostgreSQL 15+, pgcrypto, uuid-ossp
 -- Conventions:
---   • All PKs are UUIDs (v4) — avoids enumeration attacks and works well
---     across distributed writes if we ever shard.
+--   • Most PKs are UUIDs (v4); audit_log uses a bigint identity.
+--     UUIDs reduce sequential enumeration; they are not authorization.
 --   • Soft-deletes via deleted_at rather than hard DELETE, except for
 --     session/token tables where we actually want rows gone.
 --   • Every mutable table gets created_at / updated_at. The updated_at
 --     column is kept accurate by a shared trigger (see bottom of file).
---   • Row-Level Security is enabled on all user-facing tables. Policies
---     are defined here so they travel with the schema.
+--   • RLS scopes tenant tables; global auth tables require a separate
+--     trusted service. Apply bootstrap.sql for explicit app privileges.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ create type org_member_role as enum (
     'owner',
     'admin',
     'member',
-    'billing',       -- can only touch invoices/subs, nothing else
+    'billing',       -- intended app permission; enforced by the trusted server
     'viewer'
 );
 
@@ -126,7 +126,7 @@ create table users (
     avatar_url          text,
     phone               text,
 
-    -- TOTP secret is encrypted at rest using pgcrypto before insert.
+    -- The trusted application must encrypt a TOTP secret before insert.
     totp_secret         text,
     totp_enabled_at     timestamptz,
 
@@ -134,8 +134,7 @@ create table users (
     failed_login_count  int not null default 0,
     locked_until        timestamptz,
 
-    -- UTC offset preference stored as interval — avoids DST headaches
-    -- compared to a tz name string.
+    -- IANA time zone name (e.g. Europe/London) for daylight-saving rules.
     timezone            text not null default 'UTC',
     locale              text not null default 'en',
 
@@ -564,8 +563,8 @@ create index idx_order_items_order_id on order_items (order_id);
 -- =============================================================================
 -- SECTION 10 — AUDIT LOG
 -- =============================================================================
--- Append-only. No updates, no deletes. This table is the source of truth
--- for security investigations, compliance, and customer support.
+-- Read-only to saas_app (bootstrap.sql); trusted administrative services
+-- append records. Owners can still modify rows. Identity values can have gaps.
 
 create table audit_log (
     id              bigint primary key generated always as identity,
@@ -656,7 +655,8 @@ create table api_keys (
     expires_at      timestamptz,
 
     created_at      timestamptz not null default now(),
-    revoked_at      timestamptz
+    revoked_at      timestamptz,
+    updated_at      timestamptz not null default now()
 );
 
 create index idx_api_keys_org_id on api_keys (org_id) where revoked_at is null;
@@ -671,7 +671,7 @@ create table webhook_endpoints (
     org_id          uuid not null references organisations (id) on delete cascade,
 
     url             text not null,
-    secret_hash     text not null,              -- used to sign payloads (HMAC-SHA256)
+    secret_hash     text not null,              -- legacy name; signer needs encrypted recoverable key material
 
     -- Which events to fan out to this endpoint.
     enabled_events  text[] not null default '{"*"}',
@@ -709,6 +709,42 @@ create index idx_webhook_deliveries_endpoint on webhook_deliveries (endpoint_id)
 create index idx_webhook_deliveries_pending
     on webhook_deliveries (next_retry_at)
     where delivered_at is null and failed_at is null;
+
+
+-- =============================================================================
+-- TENANT REFERENCE INTEGRITY
+-- =============================================================================
+-- UUID existence alone does not prove two linked resources share a tenant.
+-- Optional resource links retain MATCH SIMPLE semantics: NULL is still allowed.
+-- Child line/item/delivery rows have one parent and derive their tenant from it.
+alter table subscriptions add constraint subscriptions_org_id_id_key unique (org_id, id);
+alter table invoices add constraint invoices_org_id_id_key unique (org_id, id);
+alter table payment_methods add constraint payment_methods_org_id_id_key unique (org_id, id);
+alter table charges add constraint charges_org_id_id_key unique (org_id, id);
+
+alter table invoices add constraint invoices_tenant_subscription_fk
+    foreign key (org_id, subscription_id) references subscriptions (org_id, id);
+alter table charges add constraint charges_tenant_invoice_fk
+    foreign key (org_id, invoice_id) references invoices (org_id, id);
+alter table charges add constraint charges_tenant_payment_method_fk
+    foreign key (org_id, payment_method_id) references payment_methods (org_id, id);
+alter table orders add constraint orders_tenant_invoice_fk
+    foreign key (org_id, invoice_id) references invoices (org_id, id);
+alter table orders add constraint orders_tenant_charge_fk
+    foreign key (org_id, charge_id) references charges (org_id, id);
+
+-- Users are global identities and may belong to multiple organisations. These
+-- tenant-associated actors/recipients must have a membership row in that org.
+-- Membership soft deletion/acceptance and role authorization remain app checks.
+-- Historical references intentionally prevent hard deletion of used memberships.
+alter table orders add constraint orders_tenant_member_fk
+    foreign key (org_id, user_id) references org_members (org_id, user_id);
+alter table api_keys add constraint api_keys_tenant_creator_fk
+    foreign key (org_id, created_by) references org_members (org_id, user_id);
+alter table notifications add constraint notifications_tenant_recipient_fk
+    foreign key (org_id, user_id) references org_members (org_id, user_id);
+-- audit_log.user_id and org_members.invited_by are global actors: administrative
+-- actions/invitations need not originate from an org member.
 
 
 -- =============================================================================
@@ -762,11 +798,13 @@ $$;
 -- =============================================================================
 -- SECTION 15 — ROW-LEVEL SECURITY
 -- =============================================================================
--- App connects as a role with no direct table grants. It sets a session
--- variable (app.current_org_id) at the start of each request, and RLS
--- ensures queries are automatically scoped to that org.
---
---   SET app.current_org_id = 'org-uuid-here';
+-- The trusted server uses the restricted role provisioned by bootstrap.sql.
+-- Authenticate and authorize the user/operation before BEGIN and SET LOCAL.
+-- app.current_org_id is caller-controlled context, NOT proof of authorization.
+-- Never give SQL access or tenant selection to an untrusted client.
+-- Missing/empty context denies tenant rows; invalid UUID context raises an error.
+-- Owners, superusers, BYPASSRLS and trusted auth/admin services are outside this
+-- boundary. See README for connection pooling and global table responsibilities.
 
 alter table organisations      enable row level security;
 alter table org_members        enable row level security;
@@ -791,12 +829,23 @@ as $$
     select nullif(current_setting('app.current_org_id', true), '')::uuid;
 $$;
 
--- Organisations — members can only see their own org.
+-- Organisations — the trusted server selects the authorized org.
 create policy rls_organisations_select on organisations
     for select using (id = current_org_id());
 
 create policy rls_organisations_update on organisations
     for update using (id = current_org_id());
+
+-- Membership roles are data: the server must enforce who can invite or change roles.
+create policy rls_org_members_all on org_members
+    for all using (org_id = current_org_id())
+    with check (org_id = current_org_id());
+
+-- Only org-scoped notifications are exposed here. Null-org personal notifications
+-- are owned by the separate trusted authentication/notification service.
+create policy rls_notifications_all on notifications
+    for all using (org_id = current_org_id())
+    with check (org_id = current_org_id());
 
 -- Subscriptions scoped to current org.
 create policy rls_subscriptions_all on subscriptions
@@ -869,12 +918,12 @@ insert into plans (id, name, slug, interval, price_cents, limits, sort_order) va
 insert into organisations (id, name, slug, billing_email) values
     ('22222222-0000-0000-0000-000000000001', 'Acme Corp', 'acme-corp', 'billing@acme.example');
 
--- Demo user (password: "hunter2" — bcrypt hash below is for demo purposes only)
+-- Demo identity only: password login is disabled (no demo credential).
 insert into users (id, email, password_hash, full_name, email_verified_at) values
     (
         '33333333-0000-0000-0000-000000000001',
         'jane@acme.example',
-        '$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj3bp.Pj5yCm',
+        null,
         'Jane Doe',
         now()
     );

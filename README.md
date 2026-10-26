@@ -2,7 +2,7 @@
 
 A database design reference for a multi-tenant SaaS application. Covers auth, organisations, subscription billing, one-off product purchases, and the usual operational stuff (audit log, webhooks, notifications).
 
-Targets **PostgreSQL 15+**. The executable contract suite and CI workflow check schema loading, application-role privileges, tenant isolation, connection reuse and reference integrity. This is a starting point for application design, with no production deployment or independent security review claimed.
+Built for **PostgreSQL 15+**, with tests for schema loading, role privileges, tenant isolation, connection reuse and reference integrity.
 
 ---
 
@@ -25,9 +25,9 @@ Targets **PostgreSQL 15+**. The executable contract suite and CI workflow check 
 
 ## Design decisions
 
-**Identifiers.** Most primary keys use `uuid_generate_v4()`; `audit_log` uses a bigint identity. UUIDs make sequential enumeration harder and permit distributed generation. IDs are not access controls. PostgreSQL sequences/identities can have gaps after rollbacks, caching or failed inserts.
+**Identifiers.** Most primary keys use `uuid_generate_v4()`, which permits distributed ID generation. `audit_log` uses a bigint identity; gaps after rollbacks, caching or failed inserts are normal. Access control comes from roles and policies, not the choice of identifier.
 
-**Soft deletes.** Most tables use a `deleted_at` timestamp rather than a hard `DELETE`. Partial indexes (`WHERE deleted_at IS NULL`) support active-row queries. Storage, performance and retention still need workload-specific evaluation.
+**Soft deletes.** Most tables use a `deleted_at` timestamp. Partial indexes (`WHERE deleted_at IS NULL`) support active-row queries while keeping history available. Set a retention policy for that history as the application grows.
 
 **JSONB for variable-width data.** Plan limits, feature flags, billing addresses, and OAuth raw profiles are all stored as JSONB. These fields vary enough between rows that normalising them into columns would just produce a wide, sparse table nobody wants to look at.
 
@@ -35,7 +35,7 @@ Targets **PostgreSQL 15+**. The executable contract suite and CI workflow check 
 
 **Single `set_updated_at` trigger.** One PL/pgSQL function, attached via a DO block loop. Adding a new table to the list is a one-liner.
 
-**Row-Level Security.** Tenant tables have RLS policies evaluated against `app.current_org_id`, with explicit grants in `bootstrap.sql`. This limits queries made under the correct authorized tenant context. The GUC is caller-controlled: a caller able to execute arbitrary SQL can change tenants. RLS does not authenticate users or enforce membership roles, and owners/superusers/`BYPASSRLS` roles bypass it. The trusted application must authorize every request and prevent SQL injection.
+**Row-Level Security.** Tenant policies filter by `app.current_org_id`, with explicit grants in `bootstrap.sql`. The application authenticates the user, authorizes the operation and sets that tenant context for the transaction. Anyone able to execute arbitrary SQL can change the context; owners, superusers and `BYPASSRLS` roles bypass the policies. RLS therefore relies on a trusted server and parameterized queries. The connection example below shows how to use it safely with a pool.
 
 **Stripe IDs on the billing rows themselves.** Keeping `stripe_subscription_id`, `stripe_invoice_id`, etc. directly on the relevant rows (rather than a separate integration table) means a single lookup ties any incoming webhook to the right record.
 
@@ -77,7 +77,7 @@ CREATE ROLE saas_server LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCRE
 GRANT saas_app TO saas_server;
 ```
 
-Authenticate the end user through a separate trusted auth service. Check current membership (`accepted_at`, `deleted_at`) and whether that user may perform the requested operation; `org_members.role` is data, not an implemented permission system. Only then, on a checked-out connection authenticated as `saas_server`:
+Authenticate the user and check their current membership (`accepted_at`, `deleted_at`) and permission for the operation. The server must interpret `org_members.role`; the database does not implement member/admin permissions. Then, on a checked-out connection authenticated as `saas_server`:
 
 ```sql
 BEGIN;
@@ -92,11 +92,13 @@ COMMIT;
 
 All request queries must execute in that same transaction. Roll back on every error before releasing the connection. Use transaction-compatible pooling; statement pooling cannot preserve this transaction contract. Never use session-level `SET app.current_org_id`: `SET LOCAL` reverts to the previous session value at commit/rollback, so initialize connections with empty context and discard/reset any connection with legacy session state. Configure tenant-free role/database defaults. Missing/empty context returns no tenant rows and rejects tenant writes; a malformed UUID raises an error. The test suite exercises commit, rollback and failure on one physical connection. See PostgreSQL's [SET LOCAL semantics](https://www.postgresql.org/docs/16/sql-set.html) and [RLS trust boundary](https://www.postgresql.org/docs/16/ddl-rowsecurity.html).
 
-The tenant role can read/update its organisation, manage tenant resources, memberships and scoped notifications, read global plans/products and read tenant audit records. It cannot create organisations, write audit history, administer global catalogues, truncate tables or change policies. Enforce finer permissions (member versus admin, billing access, notification recipient visibility, soft-deleted rows and hidden catalogue entries) in the trusted server. In particular, the tenant notification policy is org-wide; it does not isolate individual users within an org.
+### Role permissions and relationships
 
-`users`, `sessions`, `one_time_tokens`, `oauth_accounts`, `notification_preferences` and `coupons` are global service data with no tenant-role grants. Null-org notifications and audit events remain administrative data. Administrative auth/billing/audit/notification services need separately reviewed privileges; this repository does not implement those services. Hashing, encryption, rotation, webhook signing and delivery are application responsibilities. The legacy `webhook_endpoints.secret_hash` field needs encrypted, recoverable signing material (or a key reference); a one-way hash alone cannot be used as the original HMAC key.
+The tenant role can read/update its organisation, manage tenant resources, memberships and scoped notifications, and read global plans/products and tenant audit records. Creating organisations, writing audit history, administering catalogues, truncating tables and changing policies require separate privileges. The server must enforce member/admin permissions, billing access, soft-delete visibility and hidden catalogue entries. Notification policies cover the whole org; the server must also filter by recipient where needed.
 
-Composite foreign keys prevent invoices linking another tenant's subscription, charges linking another tenant's invoice/payment method, and orders linking another tenant's invoice/charge. Orders, API key creators and scoped notification recipients require an org membership row. This is reference consistency, not proof of active membership or authorization. Global audit/invitation actors may legitimately be administrators outside the org. Child line/item/delivery rows derive their tenant from their sole parent. Optional resource links remain nullable; historical references can prevent hard deletion of membership rows. Existing deployments need a reviewed migration and cleanup of inconsistent data before adding these constraints.
+`users`, `sessions`, `one_time_tokens`, `oauth_accounts`, `notification_preferences` and `coupons` have no tenant-role grants. Null-org notifications and audit events also belong to administrative services, which need their own privileges. Those services handle hashing, encryption, rotation, webhook signing and delivery. Despite its name, `webhook_endpoints.secret_hash` needs encrypted, recoverable signing material or a key reference: a one-way hash cannot recover the original HMAC key.
+
+Composite foreign keys keep subscriptions, invoices, charges, payment methods and orders in the same tenant. Orders, API key creators and scoped notification recipients require an org membership row; the server still checks whether that membership is active. Audit and invitation actors may be administrators outside the org. Child line/item/delivery rows inherit their tenant from their parent. Optional links remain nullable, and historical references can prevent hard deletion of memberships. When adapting an existing database, clean up inconsistent references before adding these constraints in a migration.
 
 ### Run the database contract tests
 
@@ -110,7 +112,7 @@ PG_BIN=/usr/lib/postgresql/16/bin bash ./scripts/test.sh
 
 The command creates a private disposable cluster under `/tmp`, accepts only local Unix-socket connections in that private directory, loads schema/bootstrap, and runs `tests/test_contract.py` with real app-role connections. It cleans up on exit and never uses the host database service. Local `trust` authentication is limited to this disposable test cluster; configure authentication for real deployments separately. The GitHub Actions workflow runs the same command on PostgreSQL 15–18.
 
-Tests cover no context, both tenants, wrong-tenant writes/reparenting, child resources, membership management, scoped/global notifications, global auth denial, role/owner differences, privilege escalation denial, connection reuse, inconsistent foreign keys even as owner, generated amounts, single default payment method and API key revocation. They do not simulate a full application or establish protection against compromised trusted server code.
+Tests cover missing context, both tenants, wrong-tenant writes and reparenting, child resources, membership management, scoped/global notifications, global auth denial, role/owner differences, privilege escalation, connection reuse and inconsistent foreign keys even as owner. They also check generated amounts, the single default payment method and API key revocation.
 
 ---
 

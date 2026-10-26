@@ -24,7 +24,10 @@ pg_ctl -D "$cluster/data" -l "$cluster/server.log" \
     exit 1
 }
 export PGHOST="$cluster/socket" PGPORT=5432 PGUSER=postgres PGDATABASE=postgres
-export PGCONNECT_TIMEOUT=5 PGOPTIONS= PGHOSTADDR= PGSERVICE=
+# An empty PGSERVICE is a real service name to libpq, not a reset. Remove
+# inherited service/address/options settings so only this private socket is used.
+unset PGSERVICE PGSERVICEFILE PGHOSTADDR PGOPTIONS
+export PGCONNECT_TIMEOUT=5
 psql -X -v ON_ERROR_STOP=1 -q -f "$repo/schema.sql" >/dev/null
 psql -X -v ON_ERROR_STOP=1 -q -f "$repo/bootstrap.sql" >/dev/null
 # Test an actual authenticated login which may SET ROLE only to saas_app.
